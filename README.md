@@ -417,7 +417,11 @@ A checkpoint is committed with each batch; rerunning the same unchanged
 file skips already committed entities. It must still read through the
 compressed prefix to reach the checkpoint. A changed file has a new
 checkpoint identity and is imported from the start. Upserts make reruns
-safe for existing entity IDs.
+safe for existing entity IDs. Press `Ctrl+C` to pause: the importer commits
+the current partial batch and its checkpoint, then exits cleanly. Run the
+same command with the same dump file to resume. Progress output and
+`validate` show the processed entity count and last ID. The count is the
+position in the dump, not the number of distinct database rows.
 
 Migration is available when an existing PostgreSQL table has a unique,
 non-null text ID and a JSON or JSONB column containing each complete

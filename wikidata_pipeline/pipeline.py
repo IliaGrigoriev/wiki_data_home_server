@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 
 import psycopg
 from psycopg import sql
@@ -21,8 +22,9 @@ SCHEMA = Path(__file__).with_name("schema.sql")
 BATCH_SIZE = 1000
 
 
+# Create the database if needed, then apply its schema and PostGIS extension.
+# -------------------------------------------------------------------------
 def setup() -> None:
-    """Create the database if needed, then apply the idempotent schema."""
     with psycopg.connect(admin_dsn(), autocommit=True) as admin:
         exists = admin.execute(
             "SELECT 1 FROM pg_database WHERE datname = %s", ("wikidata",)
@@ -35,10 +37,11 @@ def setup() -> None:
     print("Wikidata schema is ready")
 
 
+# Save a batch of entities and its checkpoint in one transaction.
+# ---------------------------------------------------------------
 def upsert_batch(db: psycopg.Connection, rows: list[tuple[str, str, str]],
                  source_key: str, source_description: str, processed: int,
                  last_id: str | None = None) -> None:
-    """Commit data and checkpoint together so a retry cannot lose a batch."""
     with db.transaction():
         with db.cursor() as cur:
             cur.executemany(
@@ -59,31 +62,28 @@ def upsert_batch(db: psycopg.Connection, rows: list[tuple[str, str, str]],
             )
 
 
-def checkpoint(db: psycopg.Connection, key: str) -> int:
-    row = db.execute(
-        "SELECT processed FROM import_progress WHERE source_key = %s", (key,)
-    ).fetchone()
-    # A SELECT starts an implicit transaction; close it before batch transactions.
-    db.commit()
-    return row[0] if row else 0
-
-
+# Read the saved count and last ID for an import or migration.
+# ---------------------------------------------------------
 def migration_checkpoint(db: psycopg.Connection, key: str) -> tuple[int, str | None]:
     row = db.execute(
         "SELECT processed, last_id FROM import_progress WHERE source_key = %s", (key,)
     ).fetchone()
+    # A SELECT starts an implicit transaction; close it before batch transactions.
     db.commit()
     return (row[0], row[1]) if row else (0, None)
 
 
+# Identify a dump by its path, size, and modification time.
+# -------------------------------------------------------
 def source_identity(path: Path) -> tuple[str, str]:
     stat = path.stat()
     description = f"{path.resolve()} size={stat.st_size} mtime_ns={stat.st_mtime_ns}"
     return hashlib.sha256(description.encode()).hexdigest(), description
 
 
+# Yield entities from a line-oriented Wikidata dump without loading it all.
+# -----------------------------------------------------------------------
 def dump_entities(path: Path):
-    """Read Wikidata's line-oriented JSON array, one entity at a time."""
     opener = bz2.open if path.suffix == ".bz2" else gzip.open if path.suffix == ".gz" else open
     with opener(path, "rt", encoding="utf-8") as stream:
         for line_number, line in enumerate(stream, 1):
@@ -102,34 +102,58 @@ def dump_entities(path: Path):
             yield entity
 
 
+# Import a dump in batches, allowing Ctrl+C to save progress and pause.
+# ------------------------------------------------------------------
 def import_dump(path: Path, batch_size: int) -> None:
     key, description = source_identity(path)
-    with psycopg.connect(target_dsn()) as db:
-        processed = checkpoint(db, key)
-        batch = []
-        seen = 0
-        for index, entity in enumerate(dump_entities(path), 1):
-            seen = index
-            if index <= processed:
-                continue
-            batch.append((entity["id"], str(entity.get("type", "unknown")),
-                          json.dumps(entity, ensure_ascii=False)))
-            if len(batch) == batch_size:
-                upsert_batch(db, batch, key, description, index)
-                processed = index
-                print(f"Imported {processed} entities", flush=True)
-                batch.clear()
-        if batch:
-            processed += len(batch)
-            upsert_batch(db, batch, key, description, processed)
-        if seen < processed:
-            raise ValueError("Stored checkpoint exceeds the number of dump entities")
-        print(f"Import complete: {processed} entities")
+    stop_requested = False
+
+    # Record a stop request so the active batch can finish before exit.
+    # ---------------------------------------------------------------
+    def request_stop(_signum, _frame):
+        nonlocal stop_requested
+        stop_requested = True
+
+    previous_handler = signal.signal(signal.SIGINT, request_stop)
+    try:
+        with psycopg.connect(target_dsn()) as db:
+            processed, last_id = migration_checkpoint(db, key)
+            if processed:
+                print(f"Resuming after {processed} entities; last ID: {last_id}", flush=True)
+            batch = []
+            seen = 0
+            for index, entity in enumerate(dump_entities(path), 1):
+                seen = index
+                if index > processed:
+                    batch.append((entity["id"], str(entity.get("type", "unknown")),
+                                  json.dumps(entity, ensure_ascii=False)))
+                    if len(batch) == batch_size:
+                        upsert_batch(db, batch, key, description, index, batch[-1][0])
+                        processed = index
+                        print(f"Processed {processed} entities; last ID: {batch[-1][0]}",
+                              flush=True)
+                        batch.clear()
+                if stop_requested:
+                    break
+            if batch:
+                processed += len(batch)
+                upsert_batch(db, batch, key, description, processed, batch[-1][0])
+                print(f"Processed {processed} entities; last ID: {batch[-1][0]}",
+                      flush=True)
+            if stop_requested:
+                print(f"Paused at {processed} entities. Run the same command to resume.")
+                return
+            if seen < processed:
+                raise ValueError("Stored checkpoint exceeds the number of dump entities")
+            print(f"Import complete: {processed} entities")
+    finally:
+        signal.signal(signal.SIGINT, previous_handler)
 
 
+# Copy entity JSON from a source PostgreSQL table in resumable batches.
+# ------------------------------------------------------------------
 def migrate(source_dsn: str, source_table: str, id_column: str,
             json_column: str, batch_size: int) -> None:
-    """Copy a source table with text ids and JSON/JSONB entity documents."""
     key = "migration:" + hashlib.sha256(
         f"{source_dsn}|{source_table}|{id_column}|{json_column}".encode()
     ).hexdigest()
@@ -166,6 +190,8 @@ def migrate(source_dsn: str, source_table: str, id_column: str,
         print(f"Migration complete: {processed} rows")
 
 
+# Report entity counts and the latest saved progress for each source.
+# ---------------------------------------------------------------
 def validate() -> None:
     with psycopg.connect(target_dsn()) as db:
         count, missing_type = db.execute(
@@ -173,13 +199,16 @@ def validate() -> None:
             "FROM entities"
         ).fetchone()
         print(f"Entities: {count}; unknown type: {missing_type}")
-        for description, processed, updated_at in db.execute(
-            "SELECT source_description, processed, updated_at "
+        for description, processed, last_id, updated_at in db.execute(
+            "SELECT source_description, processed, last_id, updated_at "
             "FROM import_progress ORDER BY updated_at DESC"
         ):
-            print(f"{description}: {processed} processed at {updated_at}")
+            print(f"{description}: {processed} processed; last ID: {last_id}; "
+                  f"updated at {updated_at}")
 
 
+# Parse the command line and run the requested pipeline operation.
+# ------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
