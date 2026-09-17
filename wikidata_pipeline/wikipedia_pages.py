@@ -24,14 +24,20 @@ PAGE_UPSERT = (
 )
 
 
+# Remove the XML namespace from an element tag.
+# ---------------------------------------------
 def _name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
+# Find a direct child by its local XML tag name.
+# ---------------------------------------------
 def _child(element: ET.Element, name: str) -> ET.Element | None:
     return next((child for child in element if _name(child.tag) == name), None)
 
 
+# Read required text from a direct child, reporting missing page fields.
+# -------------------------------------------------------------------
 def _required_text(element: ET.Element, name: str) -> str:
     child = _child(element, name)
     if child is None or child.text is None:
@@ -39,6 +45,8 @@ def _required_text(element: ET.Element, name: str) -> str:
     return child.text
 
 
+# Yield page metadata and raw wikitext from a streamed XML dump.
+# ------------------------------------------------------------
 def dump_pages(path: Path):
     opener = bz2.open if path.suffix == ".bz2" else gzip.open if path.suffix == ".gz" else open
     with opener(path, "rb") as stream:
@@ -62,6 +70,8 @@ def dump_pages(path: Path):
             root.clear()
 
 
+# Import pages in resumable batches, saving progress on Ctrl+C.
+# ----------------------------------------------------------
 def import_pages(path: Path, batch_size: int) -> bool:
     key, description = source_identity(path, "wikipedia-xml")
     with stop_on_sigint() as stopped, psycopg.connect(target_dsn()) as db:
@@ -96,6 +106,8 @@ def import_pages(path: Path, batch_size: int) -> bool:
         return True
 
 
+# Parse arguments for running the pages importer directly.
+# ------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("path", nargs="?", type=Path, default=ENWIKI_DUMP_PATH)

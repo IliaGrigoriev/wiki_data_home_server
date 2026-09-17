@@ -22,6 +22,8 @@ ENTITY_UPSERT = (
 )
 
 
+# Yield entities from a line-oriented Wikidata dump without loading it all.
+# -----------------------------------------------------------------------
 def dump_entities(path: Path):
     opener = bz2.open if path.suffix == ".bz2" else gzip.open if path.suffix == ".gz" else open
     with opener(path, "rt", encoding="utf-8") as stream:
@@ -41,6 +43,8 @@ def dump_entities(path: Path):
             yield entity
 
 
+# Import entities in resumable batches, saving progress on Ctrl+C.
+# -------------------------------------------------------------
 def import_entries(path: Path, batch_size: int) -> bool:
     key, description = source_identity(path)
     with stop_on_sigint() as stopped, psycopg.connect(target_dsn()) as db:
@@ -74,6 +78,8 @@ def import_entries(path: Path, batch_size: int) -> bool:
         return True
 
 
+# Copy entity JSON from an existing PostgreSQL table in resumable batches.
+# --------------------------------------------------------------------
 def migrate(source_dsn: str, source_table: str, id_column: str,
             json_column: str, batch_size: int) -> None:
     key = "migration:" + hashlib.sha256(
@@ -111,6 +117,8 @@ def migrate(source_dsn: str, source_table: str, id_column: str,
         print(f"Migration complete: {processed} rows")
 
 
+# Parse arguments for running the entries importer directly.
+# --------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("path", nargs="?", type=Path, default=DUMP_PATH)

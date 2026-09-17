@@ -15,6 +15,8 @@ from const import SCHEMA_PATH
 BATCH_SIZE = 1000
 
 
+# Create the target database if needed, then apply its schema.
+# ----------------------------------------------------------
 def setup() -> None:
     with psycopg.connect(admin_dsn(), autocommit=True) as admin:
         exists = admin.execute(
@@ -28,6 +30,8 @@ def setup() -> None:
     print("Wikidata schema is ready")
 
 
+# Identify a dump by its kind, resolved path, size, and modification time.
+# ----------------------------------------------------------------------
 def source_identity(path: Path, kind: str = "") -> tuple[str, str]:
     stat = path.stat()
     description = f"{path.resolve()} size={stat.st_size} mtime_ns={stat.st_mtime_ns}"
@@ -36,6 +40,8 @@ def source_identity(path: Path, kind: str = "") -> tuple[str, str]:
     return hashlib.sha256(description.encode()).hexdigest(), description
 
 
+# Read the last committed position and ID for an import source.
+# ----------------------------------------------------------
 def checkpoint(db: psycopg.Connection, key: str) -> tuple[int, str | None]:
     row = db.execute(
         "SELECT processed, last_id FROM import_progress WHERE source_key = %s", (key,)
@@ -45,6 +51,8 @@ def checkpoint(db: psycopg.Connection, key: str) -> tuple[int, str | None]:
     return (row[0], row[1]) if row else (0, None)
 
 
+# Write rows and their progress checkpoint in one transaction.
+# ----------------------------------------------------------
 def save_batch(db: psycopg.Connection, statement: str, rows: list[tuple],
                key: str, description: str, processed: int,
                last_id: str | None) -> None:
@@ -62,10 +70,14 @@ def save_batch(db: psycopg.Connection, statement: str, rows: list[tuple],
             )
 
 
+# Turn Ctrl+C into a stop flag so the current batch can be committed.
+# ---------------------------------------------------------------
 @contextmanager
 def stop_on_sigint():
     stopped = False
 
+    # Record a stop request without interrupting the active write.
+    # ---------------------------------------------------------
     def request_stop(_signum, _frame):
         nonlocal stopped
         stopped = True

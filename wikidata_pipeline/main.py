@@ -14,6 +14,8 @@ from wikidata_entries import import_entries, migrate
 from wikipedia_pages import import_pages
 
 
+# Report row counts and the latest saved position for each import source.
+# -------------------------------------------------------------------
 def validate() -> None:
     with psycopg.connect(target_dsn()) as db:
         entities, missing_type = db.execute(
@@ -34,6 +36,8 @@ def validate() -> None:
                   f"updated at {updated_at}")
 
 
+# Route setup, import, migration, and validation commands.
+# -------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
