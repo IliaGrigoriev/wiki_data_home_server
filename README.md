@@ -381,11 +381,9 @@ physical files themselves.
 ### Pipeline template
 
 The database-specific template lives in [`wikidata_pipeline/`](wikidata_pipeline/).
-Run it **on the server**, after the cluster is online and `/data/wiki` is
-mounted. It creates the `wikidata` database, enables PostGIS, and stores
-Wikidata entities as JSONB keyed by entity ID. It never moves PostgreSQL
-files. The schema is intentionally small until the intended query patterns
-and the existing source schema are known.
+Run it **on the server**, after the cluster is online. It creates the
+`wikidata` database, enables PostGIS, and stores Wikidata entities as JSONB
+and Wikipedia pages as XML revision text. It never moves PostgreSQL files.
 
 Install the PostgreSQL 14 PostGIS package on the server if it is not already
 available (for example, `postgresql-14-postgis-3` on Ubuntu), then install
@@ -405,23 +403,39 @@ such as `PGHOST`, `PGUSER`, and `PGPASSWORD` also work. The target DSN must
 point to the `wikidata` database created by setup.
 
 ``` bash
-.venv/bin/python pipeline.py setup
-.venv/bin/python pipeline.py import-dump /path/to/latest-all.json.bz2
-.venv/bin/python pipeline.py validate
+.venv/bin/python main.py import-all
+.venv/bin/python main.py validate
 ```
 
-`import-dump` accepts plain JSON, `.gz`, or `.bz2`. It reads a Wikidata
+Filesystem paths are collected in [`wikidata_pipeline/const.py`](wikidata_pipeline/const.py).
+`main.py import-all` reads `/home/ilia/Data/wiki/latest-all.json.bz2` and
+`/home/ilia/Data/wiki/enwiki-latest-pages-articles-multistream.xml.bz2` by
+default. Use `--entries-path` and `--pages-path` to override them. The
+PostgreSQL path in `const.py` remains the location documented in the setup
+steps above. Changing it does not move or reconfigure a cluster; check the
+actual location with `pg_lsclusters` on the server.
+
+`main.py` calls `wikidata_entries.py` and `wikipedia_pages.py`. Both use
+`helper.py` for database setup, checkpoints, batch transactions, and graceful
+pause. To import one source, use `main.py import-entries` or `main.py
+import-pages`, optionally followed by a different file path. The old
+`pipeline.py import-dump` command still works for Wikidata entries.
+
+The entries importer accepts plain JSON, `.gz`, or `.bz2`. It reads a Wikidata
 line-oriented JSON array one entity at a time and commits 1,000 entities
 per batch by default. It never expands the whole dump on disk or in memory.
-A checkpoint is committed with each batch; rerunning the same unchanged
-file skips already committed entities. It must still read through the
-compressed prefix to reach the checkpoint. A changed file has a new
-checkpoint identity and is imported from the start. Upserts make reruns
-safe for existing entity IDs. Press `Ctrl+C` to pause: the importer commits
-the current partial batch and its checkpoint, then exits cleanly. Run the
-same command with the same dump file to resume. Progress output and
-`validate` show the processed entity count and last ID. The count is the
-position in the dump, not the number of distinct database rows.
+The pages importer streams the compressed XML and stores page ID, title,
+namespace, redirect title, revision ID, and raw wikitext in
+`wikipedia_pages`. It imports every page in the archive; it does not render
+wikitext or link pages to Wikidata entities.
+
+Each importer commits a checkpoint with each batch. Rerunning the same
+unchanged file resumes after committed records, although it must reread the
+compressed prefix to reach the checkpoint. A changed file starts a new
+checkpoint. Upserts make reruns safe. Press `Ctrl+C` to commit the current
+partial batch and pause; run the same command to resume. `validate` reports
+both table counts and saved positions. For the full dumps, plan for database
+space beyond the compressed file sizes and a long import time.
 
 Migration is available when an existing PostgreSQL table has a unique,
 non-null text ID and a JSON or JSONB column containing each complete
