@@ -360,10 +360,8 @@ rather than repeated manually:
 
 ``` text
 - creating the wikidata database
-- installing/enabling PostGIS
 - creating tables and indexes
 - importing Wikidata
-- migrating existing extracted data
 - validating imported data
 - resumable/checkpointed dump processing
 ```
@@ -382,12 +380,10 @@ physical files themselves.
 
 The database-specific template lives in [`wikidata_pipeline/`](wikidata_pipeline/).
 Run it **on the server**, after the cluster is online. It creates the
-`wikidata` database, enables PostGIS, and stores Wikidata entities as JSONB
+`wikidata` database and stores Wikidata entities as JSONB
 and Wikipedia pages as XML revision text. It never moves PostgreSQL files.
 
-Install the PostgreSQL 14 PostGIS package on the server if it is not already
-available (for example, `postgresql-14-postgis-3` on Ubuntu), then install
-the Python dependency in a virtual environment:
+Install the Python dependency in a virtual environment:
 
 ``` bash
 cd wikidata_pipeline
@@ -395,67 +391,116 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-Connect as a role that can create a database and extensions for `setup`.
+Connect as a role that can create a database during setup.
 The default libpq connection strings are `dbname=postgres` for the admin
-connection and `dbname=wikidata` for the target. Set `WIKIDATA_ADMIN_DSN`
-and `WIKIDATA_DSN` to override them. Ordinary libpq environment variables
+connection and `dbname=wikidata` for the target. Both are defined in
+`Settings` in `wikidata_pipeline/const.py`. Ordinary libpq environment variables
 such as `PGHOST`, `PGUSER`, and `PGPASSWORD` also work. The target DSN must
 point to the `wikidata` database created by setup.
 
 ``` bash
-.venv/bin/python main.py import-all
-.venv/bin/python main.py validate
+.venv/bin/python main.py --build-wikidata-index
+.venv/bin/python main.py --import-all
 ```
 
 Filesystem paths are collected in [`wikidata_pipeline/const.py`](wikidata_pipeline/const.py).
-`main.py import-all` reads `/home/ilia/Data/wiki/latest-all.json.bz2` and
-`/home/ilia/Data/wiki/enwiki-latest-pages-articles-multistream.xml.bz2` by
-default. Use `--entries-path` and `--pages-path` to override them. The
-PostgreSQL path in `const.py` remains the location documented in the setup
+`main.py` reads `/home/ilia/Data/wiki/latest-all.json.bz2` and
+`/home/ilia/Data/wiki/enwiki-latest-pages-articles-multistream.xml.bz2`.
+The Wikipedia import also requires the matching
+`enwiki-latest-pages-articles-multistream-index.txt.bz2` in the same
+directory. Edit `Settings` in `const.py` to change the file locations. The PostgreSQL path
+in `Settings` remains the location documented in the setup
 steps above. Changing it does not move or reconfigure a cluster; check the
 actual location with `pg_lsclusters` on the server.
 
-`main.py` calls `wikidata_entries.py` and `wikipedia_pages.py`. Both use
-`helper.py` for database setup, checkpoints, batch transactions, and graceful
-pause. To import one source, use `main.py import-entries` or `main.py
-import-pages`, optionally followed by a different file path. The old
-`pipeline.py import-dump` command still works for Wikidata entries.
+### Why the pipeline has separate scripts
 
-The entries importer accepts plain JSON, `.gz`, or `.bz2`. It reads a Wikidata
-line-oriented JSON array one entity at a time and commits 1,000 entities
-per batch by default. It never expands the whole dump on disk or in memory.
-The pages importer streams the compressed XML and stores page ID, title,
-namespace, redirect title, revision ID, and raw wikitext in
-`wikipedia_pages`. It imports every page in the archive; it does not render
-wikitext or link pages to Wikidata entities.
+The dumps have different formats and different ways to resume. Keeping their
+readers separate lets each use the right index while sharing the database and
+checkpoint behavior:
 
-Each importer commits a checkpoint with each batch. Rerunning the same
-unchanged file resumes after committed records, although it must reread the
-compressed prefix to reach the checkpoint. A changed file starts a new
-checkpoint. Upserts make reruns safe. Press `Ctrl+C` to commit the current
-partial batch and pause; run the same command to resume. `validate` reports
-both table counts and saved positions. For the full dumps, plan for database
-space beyond the compressed file sizes and a long import time.
+| File | Responsibility and reason |
+| --- | --- |
+| `main.py` | `PipelineCLI` provides two explicit actions. `--build-wikidata-index` prepares only the Wikidata dump; `--import-all` sets up PostgreSQL, imports entries and then pages, and reports counts. Index creation is separate because it requires a full scan and may take hours. |
+| `wikidata_index.py` | `WikidataBlockIndex` builds and loads the Wikidata bzip2 block map. The JSON dump has no companion multistream index, so this map must be generated locally. |
+| `wikidata_entries.py` | `WikidataEntryImporter` reads the Wikidata JSON array one entity at a time and stores each complete entity as JSONB. Its checkpoint includes the decoded byte position needed for a fast indexed restart. |
+| `wikipedia_pages.py` | `WikipediaPageImporter` reads the Wikipedia XML using its matching multistream index and stores page fields and raw wikitext. Its compressed streams can be opened at known byte positions. |
+| `helper.py` and `schema.sql` | `Database`, `WorkerPlanner`, `OrderedBatchWriter`, `ProgressBar`, and `StopSignal` share setup, worker sizing, ordered writes, progress, and stop handling. The schema stores checkpoints. Rows and their checkpoint are committed in the same transaction, so a restart does not skip an unwritten batch. |
+| `const.py` | `Settings` holds dump paths, index paths, PostgreSQL connection strings, and fixed settings in one place. |
 
-Migration is available when an existing PostgreSQL table has a unique,
-non-null text ID and a JSON or JSONB column containing each complete
-entity document. Keep the source table stable while migrating. Set the
-source connection and table/column names for that server:
+### Why the indexes matter
 
-``` bash
-export WIKIDATA_SOURCE_DSN='host=localhost dbname=existing_db user=your_user'
-.venv/bin/python pipeline.py migrate --source-table public.entities \
-  --id-column id --json-column data
-.venv/bin/python pipeline.py validate
-```
+`--build-wikidata-index` scans `latest-all.json.bz2` with parallel bzip2
+decompression and saves block offsets as `latest-all.json.bz2.blocks.json`
+beside the dump. It reads the compressed file once without writing an
+uncompressed copy. A valid existing index skips this scan. The index belongs
+to the exact dump version; rebuild it after replacing the dump. The command
+shows a progress bar based on compressed bytes scanned.
 
-Migration commits batches with the last copied ID so it can resume after
-an interruption. It upserts by entity ID. The source table name and column
-names are quoted as SQL identifiers. If the source uses another structure,
-adapt `migrate()` to extract the desired entity JSON before running it.
-`validate` reports row counts and recorded checkpoints; it does not prove
-that every source entity was imported. Compare its count with the source
-count, and inspect representative rows before relying on the data.
+The entry importer saves a decompressed byte offset with each committed
+batch. On restart, the block map lets it seek near that offset and continue
+with the next entity. If the map is absent, the importer warns and asks
+whether to continue. Continuing still saves byte offsets, but every restart
+must decompress and scan from the beginning to skip committed entries. An
+older checkpoint without an offset needs one such scan even after the index
+is built.
+
+Wikipedia provides a separate
+[multistream index](https://meta.wikimedia.org/wiki/Data_dumps/Dump_format#Multistream_dumps)
+with compressed stream positions. The page importer uses it to restart at
+the stream containing the next page, then skips only pages already committed
+within that stream. If this companion index is missing, the script downloads
+it after checking that the local XML dump has the current
+[Wikimedia enwiki latest dump](https://dumps.wikimedia.org/enwiki/latest/)
+size. An index from another run may have different offsets; if the local XML
+differs from `latest`, provide its matching index yourself.
+
+### Why imports use batches and checkpoints
+
+The dumps are too large to expand into memory, and a full uncompressed copy
+would consume substantial disk space. The importers read them in small parts
+instead. The entry importer accepts plain JSON, `.gz`, or `.bz2`, parses
+one entity at a time, and stores it in `entities` as JSONB. The page importer
+stores page ID, title, namespace, redirect title, revision ID, and raw
+wikitext in `wikipedia_pages`; it does not render wikitext or link pages to
+Wikidata entities. Both commit up to 1,000 rows per batch by default; an
+8 MiB byte limit can make a batch smaller.
+
+`--import-all` uses the parallel decoder and bounded worker queues adapted
+from the preprocessing approach in the separate tripplanner project. It
+still stores every Wikidata entity and every Wikipedia page; it does not use
+that project's POI or country filters. The script chooses its worker counts
+on the machine where it runs, using available CPU and memory. This E540 has
+an Intel Core i5-4200M (two cores, four threads) and 16 GiB of RAM. With at
+least 4 GiB currently available, it uses two bzip2 workers, one JSON parser
+process, and one PostgreSQL writer thread.
+With less available memory or fewer CPUs, it reduces the bzip2 worker count
+to one. It allows a second parser only with at least eight CPUs and 8 GiB
+available memory. The single writer overlaps SQL with reading and parsing,
+while keeping batch checkpoints in source order. Queues and batches are
+bounded by record count and bytes to limit memory use alongside PostgreSQL.
+Wikipedia multistreams are decoded sequentially, with SQL writing in the
+background; this retains the stream order needed for page checkpoints. The
+data volume is on two external USB disks, so one ordered SQL writer also
+avoids adding several competing write streams to that storage.
+
+Each batch and its checkpoint are committed together. A finished source is
+marked complete and skipped on later runs; a changed dump gets a new source
+identity and a new checkpoint. Upserts make repeated rows safe. Press
+`Ctrl+C` to commit the current partial batch and pause, then run the same
+command to resume. `--import-all` runs entries before pages and reports table
+counts and saved positions when both finish. To run one importer directly,
+use `.venv/bin/python wikidata_entries.py` or
+`.venv/bin/python wikipedia_pages.py` after setting up the database. For the
+full dumps, plan for database space beyond their compressed sizes and a long
+import time. Compare the reported counts with the source dumps and inspect
+representative rows before relying on the data.
+
+During `--import-all`, separate progress bars show compressed-file progress
+and the number of entries or pages read. The percentage estimates how far
+the reader has moved through each compressed dump; committed progress is
+stored in PostgreSQL after each batch. A resumed import can jump forward
+when it reaches its saved position.
 
 ## Useful status commands
 

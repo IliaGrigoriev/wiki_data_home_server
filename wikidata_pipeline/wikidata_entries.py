@@ -1,133 +1,208 @@
 """Stream Wikidata JSON entries into PostgreSQL."""
 
-import argparse
 import bz2
+from collections import deque
+from concurrent.futures import Future, ProcessPoolExecutor
+from contextlib import ExitStack, closing
 import gzip
-import hashlib
 import json
+import multiprocessing
 from pathlib import Path
 
+import indexed_bzip2
 import psycopg
-from psycopg import sql
 
-from config import target_dsn
-from const import DUMP_PATH
-from helper import BATCH_SIZE, checkpoint, save_batch, source_identity, stop_on_sigint
-
-
-ENTITY_UPSERT = (
-    "INSERT INTO entities (id, entity_type, data) VALUES (%s, %s, %s::jsonb) "
-    "ON CONFLICT (id) DO UPDATE SET "
-    "entity_type = EXCLUDED.entity_type, data = EXCLUDED.data"
-)
+from const import Settings
+from helper import Database, OrderedBatchWriter, ProgressBar, StopSignal, WorkerPlanner
+from wikidata_index import WikidataBlockIndex
 
 
-# Yield entities from a line-oriented Wikidata dump without loading it all.
-# -----------------------------------------------------------------------
-def dump_entities(path: Path):
-    opener = bz2.open if path.suffix == ".bz2" else gzip.open if path.suffix == ".gz" else open
-    with opener(path, "rt", encoding="utf-8") as stream:
-        for line_number, line in enumerate(stream, 1):
-            line = line.strip()
-            if line in ("", "[", "]"):
-                continue
-            line = line.removesuffix(",").strip()
-            try:
-                entity = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(
-                    f"Line {line_number}: expected one complete JSON entity per line"
-                ) from exc
-            if not isinstance(entity, dict) or not isinstance(entity.get("id"), str):
-                raise ValueError(f"Line {line_number}: entity has no string id")
-            yield entity
+class WikidataEntryImporter:
+    """Decode, parse, and persist every Wikidata entity in source order."""
 
-
-# Import entities in resumable batches, saving progress on Ctrl+C.
-# -------------------------------------------------------------
-def import_entries(path: Path, batch_size: int) -> bool:
-    key, description = source_identity(path)
-    with stop_on_sigint() as stopped, psycopg.connect(target_dsn()) as db:
-        processed, last_id = checkpoint(db, key)
-        if processed:
-            print(f"Resuming entries after {processed}; last ID: {last_id}", flush=True)
-        batch = []
-        seen = 0
-        for index, entity in enumerate(dump_entities(path), 1):
-            seen = index
-            if index > processed:
-                batch.append((entity["id"], str(entity.get("type", "unknown")),
-                              json.dumps(entity, ensure_ascii=False)))
-                if len(batch) == batch_size:
-                    save_batch(db, ENTITY_UPSERT, batch, key, description, index, batch[-1][0])
-                    processed = index
-                    print(f"Processed {processed} entries; last ID: {batch[-1][0]}", flush=True)
-                    batch.clear()
-            if stopped():
-                break
-        if batch:
-            processed += len(batch)
-            save_batch(db, ENTITY_UPSERT, batch, key, description, processed, batch[-1][0])
-            print(f"Processed {processed} entries; last ID: {batch[-1][0]}", flush=True)
-        if stopped():
-            print(f"Paused at {processed} entries. Run the same command to resume.")
-            return False
-        if seen < processed:
-            raise ValueError("Stored checkpoint exceeds the number of dump entries")
-        print(f"Entry import complete: {processed} entries")
-        return True
-
-
-# Copy entity JSON from an existing PostgreSQL table in resumable batches.
-# --------------------------------------------------------------------
-def migrate(source_dsn: str, source_table: str, id_column: str,
-            json_column: str, batch_size: int) -> None:
-    key = "migration:" + hashlib.sha256(
-        f"{source_dsn}|{source_table}|{id_column}|{json_column}".encode()
-    ).hexdigest()
-    description = f"source table {source_table} ({id_column}, {json_column})"
-    query = sql.SQL(
-        "SELECT {}, {} FROM {} WHERE (%s::text IS NULL OR {} > %s) "
-        "ORDER BY {} LIMIT %s"
-    ).format(
-        sql.Identifier(id_column), sql.Identifier(json_column),
-        sql.Identifier(*source_table.split(".")), sql.Identifier(id_column),
-        sql.Identifier(id_column),
+    ENTITY_UPSERT = (
+        "INSERT INTO entities (id, entity_type, data) VALUES (%s, %s, %s::jsonb) "
+        "ON CONFLICT (id) DO UPDATE SET "
+        "entity_type = EXCLUDED.entity_type, data = EXCLUDED.data"
     )
-    with psycopg.connect(source_dsn) as source, psycopg.connect(target_dsn()) as target:
-        processed, last_id = checkpoint(target, key)
-        while True:
-            rows = source.execute(query, (last_id, last_id, batch_size)).fetchall()
-            if not rows:
-                break
-            batch = []
-            for entity_id, payload in rows:
-                if not isinstance(entity_id, str):
-                    raise ValueError("Source IDs must be text")
-                if isinstance(payload, str):
-                    payload = json.loads(payload)
-                if not isinstance(payload, dict):
-                    raise ValueError(f"Source entity {entity_id} is not a JSON object")
-                batch.append((entity_id, str(payload.get("type", "unknown")),
-                              json.dumps(payload, ensure_ascii=False)))
-            last_id = rows[-1][0]
-            processed += len(batch)
-            save_batch(target, ENTITY_UPSERT, batch, key, description, processed, last_id)
-            print(f"Migrated {processed} rows", flush=True)
-        print(f"Migration complete: {processed} rows")
 
+    def __init__(self, path: Path = Settings.DUMP_PATH,
+                 batch_size: int = Settings.BATCH_SIZE,
+                 index_path: Path = Settings.WIKIDATA_INDEX_PATH) -> None:
+        self.path = path
+        self.batch_size = batch_size
+        self.block_index = WikidataBlockIndex(path, index_path)
 
-# Parse arguments for running the entries importer directly.
-# --------------------------------------------------------
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("path", nargs="?", type=Path, default=DUMP_PATH)
-    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
-    args = parser.parse_args()
-    if args.batch_size < 1:
-        parser.error("--batch-size must be positive")
-    import_entries(args.path, args.batch_size)
+    # Yield raw entities with decoded and compressed offsets for parallel parsing.
+    # -------------------------------------------------------------------------
+    def _records(self, block_offsets: dict[int, int] | None,
+                 start_offset: int, decompressor_count: int):
+        with ExitStack() as opened:
+            if block_offsets is not None:
+                stream = opened.enter_context(
+                    indexed_bzip2.open(
+                        str(self.path), parallelization=decompressor_count
+                    )
+                )
+                stream.set_block_offsets(block_offsets)
+                compressed_position = lambda: stream.tell_compressed() // 8
+            else:
+                raw = opened.enter_context(self.path.open("rb"))
+                if self.path.suffix == ".bz2":
+                    stream = opened.enter_context(bz2.BZ2File(raw))
+                elif self.path.suffix == ".gz":
+                    stream = opened.enter_context(gzip.GzipFile(fileobj=raw))
+                else:
+                    stream = raw
+                compressed_position = raw.tell
+            if start_offset:
+                stream.seek(start_offset)
+            while line := stream.readline():
+                next_offset = stream.tell()
+                line = line.strip()
+                if line in (b"", b"[", b"]"):
+                    continue
+                yield line.removesuffix(b",").strip(), next_offset, compressed_position()
+
+    # Parse a bounded group in another process; static methods can be pickled.
+    # ----------------------------------------------------------------------
+    @staticmethod
+    def parse_batch(records: list[tuple[int, bytes, int]]) -> list[tuple[str, str, str, int]]:
+        rows = []
+        for position, payload, decoded_offset in records:
+            try:
+                entity = json.loads(payload)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Entry {position}: expected one complete JSON entity") from exc
+            if not isinstance(entity, dict) or not isinstance(entity.get("id"), str):
+                raise ValueError(f"Entry {position}: entity has no string id")
+            rows.append((entity["id"], str(entity.get("type", "unknown")),
+                         payload.decode("utf-8"), decoded_offset))
+        return rows
+
+    # Explain the restart cost and ask before importing without a block index.
+    # ---------------------------------------------------------------------
+    def _confirm_without_index(self) -> bool:
+        print(
+            f"Warning: Wikidata bzip2 block index is missing: {self.block_index.index_path}\n"
+            "The index maps compressed blocks to decompressed byte positions so "
+            "an interrupted import can seek near its checkpoint. Without it, each "
+            "restart must decompress and scan from the beginning to skip already "
+            "committed entries; this may take hours.\n"
+            "Build it first with: python main.py --build-wikidata-index",
+            flush=True,
+        )
+        try:
+            return input("Continue without the index? [y/N] ").strip().lower() in ("y", "yes")
+        except EOFError:
+            return False
+
+    # Consume parser results in source order and queue bounded SQL batches.
+    # ---------------------------------------------------------------
+    def _consume_parsed(self) -> None:
+        for entity_id, entity_type, payload, decoded_offset in self.parse_pending.popleft().result():
+            self.sql_batch.append((entity_id, entity_type, payload))
+            self.sql_batch_bytes += len(payload)
+            self.last_id, self.last_offset = entity_id, decoded_offset
+            if (len(self.sql_batch) >= self.batch_size
+                    or self.sql_batch_bytes >= Settings.MAX_BATCH_BYTES):
+                self.queued_count += len(self.sql_batch)
+                self.writer.submit(self.sql_batch.copy(), self.queued_count,
+                                   self.last_id, self.last_offset)
+                self.sql_batch.clear()
+                self.sql_batch_bytes = 0
+
+    # Import resumable batches, draining queued work when Ctrl+C is requested.
+    # ----------------------------------------------------------------------
+    def run(self) -> bool:
+        key, description = Database.source_identity(self.path)
+        with StopSignal() as stopped, psycopg.connect(Settings.TARGET_DSN) as db:
+            processed, last_id, completed, saved_offset = Database.checkpoint(db, key)
+            if completed:
+                print(f"Entry import already complete: {processed} entries")
+                return True
+            block_offsets = None
+            if self.path.suffix == ".bz2":
+                if self.block_index.index_path.is_file():
+                    block_offsets = self.block_index.load()
+                elif not self._confirm_without_index():
+                    print("Entry import cancelled before reading the dump")
+                    return False
+            start_offset = saved_offset if block_offsets is not None and saved_offset else 0
+            if processed and not start_offset:
+                print("Scanning the dump from the beginning to reach the checkpoint", flush=True)
+            if processed:
+                print(f"Resuming entries after {processed}; last ID: {last_id}", flush=True)
+            plan = WorkerPlanner.choose()
+            print(f"Workers: {plan.decompressors} bzip2, {plan.parsers} JSON, "
+                  f"{plan.writers} PostgreSQL", flush=True)
+            progress = ProgressBar("Wikidata entries", self.path.stat().st_size, "entries")
+            progress.update(0, processed, force=True)
+            seen = processed if start_offset else 0
+            self.last_id = last_id
+            self.last_offset = saved_offset if start_offset else None
+            self.queued_count = processed
+            self.sql_batch: list[tuple] = []
+            self.sql_batch_bytes = 0
+            self.parse_pending: deque[Future[list[tuple[str, str, str, int]]]] = deque()
+            self.writer = OrderedBatchWriter(self.ENTITY_UPSERT, key, description)
+            try:
+                with ProcessPoolExecutor(
+                    max_workers=plan.parsers,
+                    mp_context=multiprocessing.get_context("spawn"),
+                ) as parsers:
+                    parse_records: list[tuple[int, bytes, int]] = []
+                    parse_bytes = 0
+                    with closing(self._records(
+                        block_offsets, start_offset, plan.decompressors
+                    )) as records:
+                        for index, (payload, decoded_offset, compressed_offset) in enumerate(
+                            records, start=processed + 1 if start_offset else 1
+                        ):
+                            seen = index
+                            progress.update(compressed_offset, index)
+                            if index == processed:
+                                self.last_offset = decoded_offset
+                            if index > processed:
+                                parse_records.append((index, payload, decoded_offset))
+                                parse_bytes += len(payload)
+                                if len(parse_records) >= 64 or parse_bytes >= 4 * 1024 * 1024:
+                                    self.parse_pending.append(
+                                        parsers.submit(self.parse_batch, parse_records)
+                                    )
+                                    parse_records = []
+                                    parse_bytes = 0
+                                    if len(self.parse_pending) >= plan.parsers * 2:
+                                        self._consume_parsed()
+                            if stopped():
+                                break
+                    if parse_records:
+                        self.parse_pending.append(parsers.submit(self.parse_batch, parse_records))
+                    while self.parse_pending:
+                        self._consume_parsed()
+                if self.sql_batch:
+                    self.queued_count += len(self.sql_batch)
+                    self.writer.submit(self.sql_batch.copy(), self.queued_count,
+                                       self.last_id, self.last_offset)
+            except BaseException:
+                progress.finish(False)
+                raise
+            finally:
+                self.writer.close()
+            processed = self.queued_count
+            if stopped():
+                progress.finish(False)
+                print(f"Paused at {processed} entries. Run the same command to resume.")
+                return False
+            if seen < processed:
+                raise ValueError("Stored checkpoint exceeds the number of dump entries")
+            Database.mark_complete(db, key, description, processed,
+                                   self.last_id, self.last_offset)
+            progress.count = processed
+            progress.finish()
+            print(f"Entry import complete: {processed} entries")
+            return True
 
 
 if __name__ == "__main__":
-    main()
+    WikidataEntryImporter().run()

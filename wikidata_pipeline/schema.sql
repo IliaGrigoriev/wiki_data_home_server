@@ -1,5 +1,3 @@
-CREATE EXTENSION IF NOT EXISTS postgis;
-
 CREATE TABLE IF NOT EXISTS entities (
     id text PRIMARY KEY,
     entity_type text NOT NULL,
@@ -25,7 +23,10 @@ CREATE TABLE IF NOT EXISTS import_progress (
     source_description text NOT NULL,
     processed bigint NOT NULL DEFAULT 0 CHECK (processed >= 0),
     last_id text,
+    decompressed_offset bigint,
+    completed boolean NOT NULL DEFAULT false,
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-ALTER TABLE import_progress ADD COLUMN IF NOT EXISTS last_id text;
+ALTER TABLE import_progress ADD COLUMN IF NOT EXISTS completed boolean NOT NULL DEFAULT false;
+ALTER TABLE import_progress ADD COLUMN IF NOT EXISTS decompressed_offset bigint;
